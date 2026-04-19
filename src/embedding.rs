@@ -261,7 +261,9 @@ impl EmbeddingService {
             }
         }
 
-        Ok(results.into_iter().map(|r| r.unwrap()).collect())
+        results.into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("Some embeddings failed to generate"))
     }
 
     /// Raw embed without any prefix

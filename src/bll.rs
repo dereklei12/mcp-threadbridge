@@ -177,8 +177,13 @@ impl BayesianLastLayer {
 
     /// Extract 256-dim features from (query_emb, candidate_emb).
     pub fn extract_features(&self, query_emb: &[f32], candidate_emb: &[f32]) -> Array1<f32> {
-        assert_eq!(query_emb.len(), self.embed_dim);
-        assert_eq!(candidate_emb.len(), self.embed_dim);
+        if query_emb.len() != self.embed_dim || candidate_emb.len() != self.embed_dim {
+            warn!(
+                "BLL dimension mismatch: expected {}, got ({}, {}), returning zeros",
+                self.embed_dim, query_emb.len(), candidate_emb.len()
+            );
+            return Array1::zeros(self.hidden_dim);
+        }
 
         match &self.extractor {
             FeatureExtractor::V1 { w1, b1 } => {
@@ -257,6 +262,21 @@ impl BayesianLastLayer {
             }
         }
 
+        // Re-symmetrize and clamp diagonal every 10 updates to prevent
+        // f32 rounding errors from breaking positive-definiteness.
+        if self.update_count % 10 == 9 {
+            for i in 0..d {
+                for j in (i + 1)..d {
+                    let avg = (self.sigma_w[[i, j]] + self.sigma_w[[j, i]]) / 2.0;
+                    self.sigma_w[[i, j]] = avg;
+                    self.sigma_w[[j, i]] = avg;
+                }
+                if self.sigma_w[[i, i]] < 1e-6 {
+                    self.sigma_w[[i, i]] = 1e-6;
+                }
+            }
+        }
+
         // Update mean
         let prediction = self.mu_w.dot(features) + self.bias;
         let error = reward - prediction;
@@ -295,7 +315,7 @@ impl BayesianLastLayer {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, &buf)
+        crate::util::atomic_write(path, &buf)
             .with_context(|| format!("Failed to save BLL posterior: {}", path.display()))?;
 
         debug!("Saved BLL posterior ({} updates, {} bytes)", self.update_count, buf.len());

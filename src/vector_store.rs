@@ -57,8 +57,8 @@ impl VectorStore {
         threshold: f32,
         bll: Option<&BayesianLastLayer>,
     ) -> Vec<SearchResult> {
-        let lambda = Config::global().search.utility_lambda;
-
+        let config = Config::global();
+        let lambda = config.search.utility_lambda;
         // === Dense retrieval ===
         let mut dense_ranked: Vec<(usize, f32)> = self.facts
             .iter()
@@ -68,11 +68,13 @@ impl VectorStore {
                 let cosine = cosine_similarity(query_embedding, fact_emb);
 
                 if cosine >= threshold {
+                    let base_score = cosine * fact.confidence;
+
                     let score = if lambda > 0.0 && !fact.utility.is_uninformed() {
                         let utility_sample = fact.utility.sample();
-                        (1.0 - lambda) * cosine + lambda * utility_sample
+                        (1.0 - lambda) * base_score + lambda * utility_sample
                     } else {
-                        cosine
+                        base_score
                     };
                     Some((idx, score))
                 } else {
@@ -193,6 +195,11 @@ mod tests {
             last_used_at: None,
             context_window: Vec::new(),
             session_id: None,
+            anchors: Vec::new(),
+            provenance: Default::default(),
+            revision_status: Default::default(),
+            supersedes: Vec::new(),
+            superseded_by: Vec::new(),
         }
     }
 

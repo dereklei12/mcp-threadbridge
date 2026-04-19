@@ -3,18 +3,23 @@
 //! Three tools: save_thread, load_thread, search_memory
 //! Core pipeline: Arctic Embed M + Dense/BM25 Hybrid + RRF + BLL v2
 
+use crate::anchor::{self, ProjectScan};
 use crate::bll::BayesianLastLayer;
 use crate::config::Config;
 use crate::embedding::{self, EmbeddingService};
 use crate::mcp::Tool;
-use crate::storage::StorageManager;
-use crate::types::{Fact, FactCategory, ProjectState, Session, Thread};
+use crate::file_manifest::FileManifest;
+use crate::provenance;
+use crate::revision;
+use crate::storage::{StorageManager, StorageMode};
+use crate::types::{Fact, FactCategory, ProjectState, RevisionStatus, Session, StateItem, Thread};
 use crate::vector_store::VectorStore;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
@@ -36,7 +41,7 @@ fn get_bll() -> &'static Mutex<Option<BayesianLastLayer>> {
         match BayesianLastLayer::try_load(weights_path) {
             Some(mut bll) => {
                 let posterior_path = dirs::home_dir()
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| PathBuf::from("."))
                     .join(".threadbridge")
                     .join("bll_posterior.bin");
                 if let Err(e) = bll.load_posterior(&posterior_path) {
@@ -70,18 +75,129 @@ fn search_buffer() -> &'static Mutex<Vec<SearchRecord>> {
 }
 
 // ================================================================
+// Background task queue
+// ================================================================
+
+enum BackgroundTask {
+    /// After save_thread: implicit feedback + CUSUM + sheaf
+    PostSave {
+        project_path: String,
+        storage_mode: StorageMode,
+    },
+    /// After load_thread: full provenance verification
+    VerifyProvenance {
+        project_path: String,
+        storage_mode: StorageMode,
+    },
+}
+
+// ================================================================
 // ToolHandler
 // ================================================================
 
 #[derive(Clone)]
 pub struct ToolHandler {
     storage: Arc<Mutex<StorageManager>>,
+    bg_sender: mpsc::Sender<BackgroundTask>,
 }
 
 impl ToolHandler {
     pub fn new(storage: StorageManager) -> Self {
+        let storage = Arc::new(Mutex::new(storage));
+        let (tx, rx) = mpsc::channel::<BackgroundTask>();
+
+        // Single background worker — all bg writes are serialized, no lost updates
+        let worker_storage = Arc::clone(&storage);
+        std::thread::Builder::new()
+            .name("tb-background".into())
+            .spawn(move || {
+                Self::background_worker(rx, &worker_storage);
+            })
+            .expect("Failed to spawn background worker thread");
+
         Self {
-            storage: Arc::new(Mutex::new(storage)),
+            storage,
+            bg_sender: tx,
+        }
+    }
+
+    /// Single worker loop: receives tasks and executes them serially.
+    fn background_worker(
+        rx: mpsc::Receiver<BackgroundTask>,
+        storage: &Arc<Mutex<StorageManager>>,
+    ) {
+        while let Ok(task) = rx.recv() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match task {
+                    BackgroundTask::PostSave { ref project_path, ref storage_mode } => {
+                        Self::bg_post_save(storage, project_path, storage_mode);
+                    }
+                    BackgroundTask::VerifyProvenance { ref project_path, ref storage_mode } => {
+                        Self::background_verify_all_provenance(storage, project_path, storage_mode);
+                    }
+                }
+            }));
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                warn!("Background task panicked: {}", msg);
+            }
+        }
+        debug!("Background worker shutting down");
+    }
+
+    /// Post-save background work: implicit feedback + CUSUM + sheaf.
+    /// Loads the latest thread from disk (no stale snapshot).
+    fn bg_post_save(
+        storage: &Arc<Mutex<StorageManager>>,
+        project_path: &str,
+        storage_mode: &StorageMode,
+    ) {
+        // 1. Implicit feedback (BLL weights + per-fact utility)
+        Self::process_implicit_feedback(storage, project_path, storage_mode);
+
+        // 2. CUSUM + sheaf
+        let config = Config::global();
+        if config.verification.cusum_enabled || config.verification.sheaf_enabled {
+            if let Ok(storage_guard) = storage.lock() {
+                if let Ok(Some(mut thread)) = storage_guard.load_thread_with_path_fix(project_path, storage_mode) {
+                    let mut bg_changed = false;
+
+                    if config.verification.cusum_enabled {
+                        let scan = ProjectScan::new(project_path);
+                        let new_manifest = FileManifest::from_scan(&scan.files_raw);
+                        if let Some(ref prev) = thread.file_manifest {
+                            let diff = new_manifest.diff(prev);
+                            thread.change_tracker.update_from_diff(
+                                &diff,
+                                config.verification.consecutive_threshold,
+                                config.verification.ewma_alpha,
+                                config.verification.ewma_threshold,
+                            );
+                        }
+                        thread.file_manifest = Some(new_manifest);
+                        bg_changed = true;
+                    }
+
+                    if config.verification.sheaf_enabled {
+                        thread.cohomology = crate::sheaf::compute_and_store_cohomology(
+                            &thread.facts,
+                            config.verification.sheaf_edge_threshold,
+                            config.verification.sheaf_min_facts,
+                        );
+                        bg_changed = true;
+                    }
+
+                    if bg_changed {
+                        let _ = storage_guard.save_thread(&thread, storage_mode);
+                    }
+                }
+            }
         }
     }
 
@@ -104,11 +220,6 @@ Each fact should be a single, clear statement that future AI can understand."#.t
                         "project_path": {
                             "type": "string",
                             "description": "Project directory path (defaults to current working directory)"
-                        },
-                        "use_local_storage": {
-                            "type": "boolean",
-                            "description": "If true, store in project's .threadbridge/ directory.",
-                            "default": true
                         },
                         "architecture": {
                             "type": "string",
@@ -154,7 +265,7 @@ Each fact should be a single, clear statement that future AI can understand."#.t
                             "description": "Summary of this session's progress"
                         }
                     },
-                    "required": ["project_path", "summary"]
+                    "required": ["summary"]
                 }),
             },
             Tool {
@@ -171,7 +282,7 @@ Use this at the start of a conversation to restore context from previous session
                             "description": "Project directory path (defaults to current working directory)"
                         }
                     },
-                    "required": ["project_path"]
+                    "required": []
                 }),
             },
             Tool {
@@ -211,15 +322,19 @@ Results include surrounding context for richer understanding."#.to_string(),
     pub fn handle_save_thread(&self, args: Value) -> Result<Value> {
         let project_path = args["project_path"]
             .as_str()
-            .context("project_path is required")?
-            .to_string();
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("THREADBRIDGE_PROJECT_PATH").ok())
+            .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
 
-        let use_local = args["use_local_storage"].as_bool().unwrap_or(true);
-        let storage = self.storage.lock().unwrap_or_else(|e| e.into_inner());
+        let storage_mode = StorageMode::from_env();
+        let storage = self.storage.lock().unwrap_or_else(|e| {
+            tracing::warn!("Storage mutex was poisoned, recovering");
+            e.into_inner()
+        });
 
         // Load existing thread or create new one
         let mut thread = storage
-            .load_thread(&project_path)?
+            .load_thread_with_path_fix(&project_path, &storage_mode)?
             .unwrap_or_else(|| Thread::new(project_path.clone()));
 
         // Update architecture if provided
@@ -227,21 +342,22 @@ Results include surrounding context for richer understanding."#.to_string(),
             thread.architecture = Some(arch.to_string());
         }
 
-        // Update state if provided
+        // Update state if provided (anchors generated later after ProjectScan)
         if let Some(state) = args.get("state") {
+            let parse_items = |key: &str| -> Vec<StateItem> {
+                state[key]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| StateItem::new(s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
             thread.state = ProjectState {
-                completed: state["completed"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default(),
-                in_progress: state["in_progress"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default(),
-                pending: state["pending"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default(),
+                completed: parse_items("completed"),
+                in_progress: parse_items("in_progress"),
+                pending: parse_items("pending"),
             };
         }
 
@@ -330,7 +446,7 @@ Results include surrounding context for richer understanding."#.to_string(),
                 id: fact_id,
                 content: entry.fact_content.clone(),
                 category: FactCategory::Decision,
-                confidence: 1.0,
+                confidence: 0.95,
                 created_at: now,
                 updated_at: now,
                 embedding: get_emb(decision_offset + i),
@@ -339,6 +455,11 @@ Results include surrounding context for richer understanding."#.to_string(),
                 last_used_at: None,
                 context_window: Vec::new(), // populated below
                 session_id: Some(session_id.clone()),
+                anchors: Vec::new(), // generated after ProjectScan
+                provenance: Default::default(),
+                revision_status: Default::default(),
+                supersedes: Vec::new(),
+                superseded_by: Vec::new(),
             };
             thread.facts.push(fact);
         }
@@ -351,7 +472,7 @@ Results include surrounding context for richer understanding."#.to_string(),
                 id: fact_id,
                 content: content.clone(),
                 category: FactCategory::General,
-                confidence: 1.0,
+                confidence: 0.8,
                 created_at: now,
                 updated_at: now,
                 embedding: get_emb(general_offset + i),
@@ -360,8 +481,66 @@ Results include surrounding context for richer understanding."#.to_string(),
                 last_used_at: None,
                 context_window: Vec::new(), // populated below
                 session_id: Some(session_id.clone()),
+                anchors: Vec::new(), // generated after ProjectScan
+                provenance: Default::default(),
+                revision_status: Default::default(),
+                supersedes: Vec::new(),
+                superseded_by: Vec::new(),
             };
             thread.facts.push(fact);
+        }
+
+        // ================================================================
+        // Confidence confirmation: boost existing facts confirmed by new facts
+        // ================================================================
+        let config = Config::global();
+        if session_facts_start_idx > 0 {
+            let (existing_facts, new_facts) = thread.facts.split_at_mut(session_facts_start_idx);
+            for existing in existing_facts.iter_mut() {
+                // Skip superseded facts
+                if existing.revision_status != RevisionStatus::Active {
+                    continue;
+                }
+                let existing_emb = match existing.embedding.as_ref() {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let max_sim = new_facts.iter()
+                    .filter_map(|nf| nf.embedding.as_ref())
+                    .map(|ne| embedding::cosine_similarity(existing_emb, ne))
+                    .fold(0.0f32, f32::max);
+
+                if max_sim > 0.8 {
+                    existing.confidence = (existing.confidence + 0.1).min(1.0);
+                    existing.updated_at = now;
+                }
+            }
+        }
+
+        // ================================================================
+        // AGM Revision detection: identify supersession pairs
+        // ================================================================
+        if config.verification.revision_enabled && session_facts_start_idx > 0 {
+            let pairs = {
+                let (existing, new_part) = thread.facts.split_at(session_facts_start_idx);
+                revision::detect_supersession(
+                    existing,
+                    new_part,
+                    config.verification.supersession_threshold,
+                )
+            };
+            for (new_id, old_id) in &pairs {
+                revision::apply_agm_revision(
+                    &mut thread.facts,
+                    &mut thread.revision_graph,
+                    new_id,
+                    old_id,
+                    now,
+                );
+            }
+            if !pairs.is_empty() {
+                debug!("AGM revision: {} supersession pairs detected", pairs.len());
+            }
         }
 
         // ================================================================
@@ -392,6 +571,44 @@ Results include surrounding context for richer understanding."#.to_string(),
         }
 
         // ================================================================
+        // Generate provenance + legacy anchors (scan project once, reuse for all)
+        // ================================================================
+        let scan = ProjectScan::new(&project_path);
+
+        // New facts: provenance + legacy anchors
+        for fact in &mut thread.facts[session_facts_start_idx..] {
+            fact.anchors = scan.generate_anchors(&fact.content);
+            if config.verification.provenance_enabled {
+                fact.provenance = provenance::generate_provenance(&fact.content, &scan);
+            }
+        }
+
+        // Architecture anchors (legacy)
+        if let Some(ref arch) = thread.architecture {
+            thread.architecture_anchors = scan.generate_anchors(arch);
+        }
+
+        // State item anchors (legacy)
+        for item in &mut thread.state.completed {
+            item.anchors = scan.generate_anchors(&item.content);
+        }
+        for item in &mut thread.state.in_progress {
+            item.anchors = scan.generate_anchors(&item.content);
+        }
+        for item in &mut thread.state.pending {
+            item.anchors = scan.generate_anchors(&item.content);
+        }
+
+        // CUSUM: ensure all provenance files are tracked
+        if config.verification.cusum_enabled {
+            for fact in &thread.facts[session_facts_start_idx..] {
+                for dep in &fact.provenance.dependencies {
+                    thread.change_tracker.ensure_file_tracked(&dep.file);
+                }
+            }
+        }
+
+        // ================================================================
         // Create Session
         // ================================================================
         let session = Session {
@@ -402,14 +619,25 @@ Results include surrounding context for richer understanding."#.to_string(),
         };
         thread.sessions.push(session);
 
+        thread.schema_version = 2;
         thread.updated_at = now;
 
         // Save thread
-        storage.save_thread(&thread, use_local)?;
+        storage.save_thread(&thread, &storage_mode)?;
 
-        let storage_location = if use_local { "local (.threadbridge/)" } else { "global (~/.threadbridge/)" };
-        info!("Saved thread: {} ({} facts, {} sessions) to {}",
-            project_path, thread.facts.len(), thread.sessions.len(), storage_location);
+        let storage_location = match &storage_mode {
+            StorageMode::Local => "local (.threadbridge/)",
+            StorageMode::Global => "global (~/.threadbridge/)",
+            StorageMode::Custom(p) => {
+                info!("Custom storage path: {:?}", p);
+                "custom"
+            }
+        };
+        let superseded_count = thread.facts.iter()
+            .filter(|f| f.revision_status == RevisionStatus::Superseded)
+            .count();
+        info!("Saved thread: {} ({} facts, {} superseded, {} sessions) to {}",
+            project_path, thread.facts.len(), superseded_count, thread.sessions.len(), storage_location);
 
         // Build response before spawning background work
         let response = json!({
@@ -418,14 +646,14 @@ Results include surrounding context for richer understanding."#.to_string(),
             "storage_location": storage_location,
             "facts_saved": session_len,
             "total_facts": thread.facts.len(),
-            "total_sessions": thread.sessions.len()
+            "total_sessions": thread.sessions.len(),
+            "superseded_count": superseded_count
         });
 
-        // Background: BLL implicit feedback
-        drop(storage);
-        let thread_clone = thread.clone();
-        std::thread::spawn(move || {
-            Self::process_bll_implicit_feedback(&thread_clone);
+        // Queue background work (serialized by worker — no lost updates)
+        let _ = self.bg_sender.send(BackgroundTask::PostSave {
+            project_path: project_path.clone(),
+            storage_mode,
         });
 
         Ok(response)
@@ -438,12 +666,39 @@ Results include surrounding context for richer understanding."#.to_string(),
     pub fn handle_load_thread(&self, args: Value) -> Result<Value> {
         let project_path = args["project_path"]
             .as_str()
-            .context("project_path is required")?;
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("THREADBRIDGE_PROJECT_PATH").ok())
+            .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
 
-        let storage = self.storage.lock().unwrap_or_else(|e| e.into_inner());
+        let storage_mode = StorageMode::from_env();
+        let storage = self.storage.lock().unwrap_or_else(|e| {
+            tracing::warn!("Storage mutex was poisoned, recovering");
+            e.into_inner()
+        });
 
-        match storage.load_thread_with_path_fix(project_path)? {
-            Some(thread) => {
+        match storage.load_thread_with_path_fix(&project_path, &storage_mode)? {
+            Some(mut thread) => {
+                let config = Config::global();
+                let stale_threshold = config.search.anchor_stale_threshold;
+
+                // CUSUM update via file manifest diff (VCS-independent)
+                if config.verification.cusum_enabled {
+                    let scan = ProjectScan::new(&project_path);
+                    let new_manifest = FileManifest::from_scan(&scan.files_raw);
+                    if let Some(ref prev) = thread.file_manifest {
+                        let diff = new_manifest.diff(prev);
+                        // Always update — even empty diffs reset consecutive counters
+                        thread.change_tracker.update_from_diff(
+                            &diff,
+                            config.verification.consecutive_threshold,
+                            config.verification.ewma_alpha,
+                            config.verification.ewma_threshold,
+                        );
+                    }
+                    // Don't update stored manifest on load — only on save.
+                    // This ensures diff reflects changes since last save.
+                }
+
                 // Recent session summaries (last 5)
                 let recent_sessions: Vec<Value> = thread.sessions.iter()
                     .rev()
@@ -455,34 +710,117 @@ Results include surrounding context for richer understanding."#.to_string(),
                     }))
                     .collect();
 
-                // Recent decisions (last 10)
+                // Recent decisions (last 10, active only) — quick-verify with provenance or anchors
                 let decisions: Vec<String> = thread.facts.iter()
-                    .filter(|f| f.category == FactCategory::Decision)
+                    .filter(|f| f.category == FactCategory::Decision && f.revision_status == RevisionStatus::Active)
                     .rev()
                     .take(10)
-                    .map(|f| f.content.clone())
+                    .map(|f| {
+                        // Prefer provenance verification, fall back to anchors
+                        if config.verification.provenance_enabled && !f.provenance.dependencies.is_empty() {
+                            let mut prov = f.provenance.clone();
+                            provenance::verify_provenance(&project_path, &mut prov);
+                            if prov.compute_score() < stale_threshold {
+                                let broken = prov.broken_patterns();
+                                format!("[STALE: {} not found] {}", broken.join(", "), f.content)
+                            } else if prov.has_broken_deps() {
+                                let broken = prov.broken_patterns();
+                                format!("[STALE: {} changed] {}", broken.join(", "), f.content)
+                            } else {
+                                f.content.clone()
+                            }
+                        } else if !f.anchors.is_empty() {
+                            let verified = anchor::verify_anchors(&project_path, &f.anchors);
+                            if anchor::grounding_score(&verified) < stale_threshold {
+                                format!("[STALE] {}", f.content)
+                            } else if anchor::any_broken(&verified) {
+                                let broken = anchor::broken_patterns(&verified);
+                                format!("[STALE: {} not found] {}", broken.join(", "), f.content)
+                            } else {
+                                f.content.clone()
+                            }
+                        } else {
+                            f.content.clone()
+                        }
+                    })
                     .collect();
 
-                info!("Loaded thread: {} ({} facts, {} sessions)",
-                    project_path, thread.facts.len(), thread.sessions.len());
+                // Verify architecture anchors
+                let architecture_stale: Vec<String> = if !thread.architecture_anchors.is_empty() {
+                    let verified = anchor::verify_anchors(&project_path, &thread.architecture_anchors);
+                    anchor::broken_patterns(&verified)
+                        .into_iter()
+                        .map(String::from)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Verify state items — any broken anchor = stale
+                let verify_state_items = |items: &[StateItem]| -> Vec<String> {
+                    items.iter().map(|item| {
+                        if item.anchors.is_empty() {
+                            return item.content.clone();
+                        }
+                        let verified = anchor::verify_anchors(&project_path, &item.anchors);
+                        if anchor::any_broken(&verified) {
+                            let broken = anchor::broken_patterns(&verified);
+                            format!("[STALE: {} not found] {}", broken.join(", "), item.content)
+                        } else {
+                            item.content.clone()
+                        }
+                    }).collect()
+                };
+
+                let state_completed = verify_state_items(&thread.state.completed);
+                let state_in_progress = verify_state_items(&thread.state.in_progress);
+                let state_pending = verify_state_items(&thread.state.pending);
+
+                // Counts
+                let active_count = thread.facts.iter()
+                    .filter(|f| f.revision_status == RevisionStatus::Active)
+                    .count();
+                let superseded_count = thread.facts.iter()
+                    .filter(|f| f.revision_status == RevisionStatus::Superseded)
+                    .count();
+
+                info!("Loaded thread: {} ({} facts, {} active, {} superseded, {} sessions)",
+                    project_path, thread.facts.len(), active_count, superseded_count, thread.sessions.len());
+
+                let mut thread_json = json!({
+                    "architecture": thread.architecture,
+                    "state": {
+                        "completed": state_completed,
+                        "in_progress": state_in_progress,
+                        "pending": state_pending
+                    },
+                    "recent_sessions": recent_sessions,
+                    "recent_decisions": decisions,
+                    "total_facts": thread.facts.len(),
+                    "total_sessions": thread.sessions.len(),
+                    "created_at": thread.created_at,
+                    "updated_at": thread.updated_at,
+                    "active_facts": active_count,
+                    "superseded_facts": superseded_count,
+                    "global_consistency": thread.cohomology.global_consistency,
+                    "alarm_files": thread.change_tracker.files_in_alarm().collect::<Vec<_>>(),
+                    "schema_version": thread.schema_version
+                });
+
+                if !architecture_stale.is_empty() {
+                    thread_json["architecture_stale_keywords"] = json!(architecture_stale);
+                }
+
+                // Queue background provenance verification (serialized by worker)
+                let _ = self.bg_sender.send(BackgroundTask::VerifyProvenance {
+                    project_path: project_path.to_string(),
+                    storage_mode,
+                });
 
                 Ok(json!({
                     "success": true,
                     "project_path": project_path,
-                    "thread": {
-                        "architecture": thread.architecture,
-                        "state": {
-                            "completed": thread.state.completed,
-                            "in_progress": thread.state.in_progress,
-                            "pending": thread.state.pending
-                        },
-                        "recent_sessions": recent_sessions,
-                        "recent_decisions": decisions,
-                        "total_facts": thread.facts.len(),
-                        "total_sessions": thread.sessions.len(),
-                        "created_at": thread.created_at,
-                        "updated_at": thread.updated_at
-                    }
+                    "thread": thread_json
                 }))
             }
             None => {
@@ -495,30 +833,179 @@ Results include surrounding context for richer understanding."#.to_string(),
         }
     }
 
+    /// Background: migrate anchors → provenance, backfill, verify, update half-life, recompute sheaf.
+    fn background_verify_all_provenance(
+        storage: &Arc<Mutex<StorageManager>>,
+        project_path: &str,
+        storage_mode: &StorageMode,
+    ) {
+        debug!("Background provenance verification started");
+        let config = Config::global();
+        let stale_threshold = config.search.anchor_stale_threshold;
+
+        // Load thread then DROP the lock — don't hold it during verification.
+        // Re-acquire only for the final save.
+        let mut thread = {
+            let storage_guard = match storage.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match storage_guard.load_thread_with_path_fix(project_path, storage_mode) {
+                Ok(Some(t)) => t,
+                _ => return,
+            }
+        }; // lock released here
+
+        let now = Utc::now();
+        let mut changed = false;
+
+        // Step 1: Migrate old anchors → provenance (lazy)
+        let mut migrated = 0;
+        for fact in &mut thread.facts {
+            if fact.provenance.dependencies.is_empty() && !fact.anchors.is_empty() {
+                fact.provenance.dependencies =
+                    provenance::migrate_anchors_to_provenance(&fact.anchors);
+                fact.provenance.recompute_score();
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            debug!("Migrated anchors to provenance for {} facts", migrated);
+            changed = true;
+        }
+
+        // Step 2: Backfill provenance for facts with neither
+        let scan = ProjectScan::new(project_path);
+        let mut backfilled = 0;
+        for fact in &mut thread.facts {
+            if fact.provenance.dependencies.is_empty() {
+                fact.provenance = provenance::generate_provenance(&fact.content, &scan);
+                fact.anchors = scan.generate_anchors(&fact.content);
+                backfilled += 1;
+            }
+        }
+        if backfilled > 0 {
+            debug!("Backfilled provenance for {} facts", backfilled);
+            changed = true;
+        }
+
+        // Step 3: Verify provenance (budget-limited if enabled)
+        let budget = if config.verification.budget_enabled {
+            Some(crate::verification_budget::VerificationBudget::allocate(
+                &thread.facts,
+                &thread.change_tracker,
+                config.verification.consecutive_threshold,
+                config.verification.ewma_threshold,
+                config.verification.verification_budget,
+            ))
+        } else {
+            None
+        };
+
+        let mut verified_count = 0u32;
+        let mut stale_count = 0u32;
+
+        for fact in &mut thread.facts {
+            if fact.provenance.dependencies.is_empty() {
+                continue;
+            }
+            if let Some(ref budget) = budget {
+                if !budget.should_verify(&fact.id) {
+                    continue;
+                }
+            }
+
+            let old_score = fact.provenance.score;
+            provenance::verify_provenance(
+                project_path,
+                &mut fact.provenance,
+            );
+            verified_count += 1;
+
+            let new_score = fact.provenance.score;
+
+            if new_score != old_score {
+                if new_score < stale_threshold {
+                    fact.confidence *= 0.5;
+                    stale_count += 1;
+                } else if fact.provenance.has_broken_deps() {
+                    fact.confidence *= new_score;
+                    stale_count += 1;
+                }
+                fact.confidence = fact.confidence.max(0.05);
+                fact.updated_at = now;
+                changed = true;
+            }
+        }
+
+        // Step 4: Sheaf cohomology recomputation
+        if config.verification.sheaf_enabled {
+            thread.cohomology = crate::sheaf::compute_and_store_cohomology(
+                &thread.facts,
+                config.verification.sheaf_edge_threshold,
+                config.verification.sheaf_min_facts,
+            );
+            changed = true;
+        }
+
+        if changed || verified_count > 0 {
+            thread.updated_at = now;
+            // Re-acquire lock only for save
+            if let Ok(storage_guard) = storage.lock() {
+                if let Err(e) = storage_guard.save_thread(&thread, storage_mode) {
+                    debug!("Failed to save background provenance verification: {}", e);
+                }
+            }
+            debug!(
+                "Provenance verification done: {} verified, {} stale, {} migrated, {} backfilled",
+                verified_count, stale_count, migrated, backfilled
+            );
+        } else {
+            debug!(
+                "Provenance verification done: no changes needed"
+            );
+        }
+    }
+
     // ================================================================
     // search_memory
     // ================================================================
 
     pub fn handle_search_memory(&self, args: Value) -> Result<Value> {
-        let project_path = args["project_path"].as_str();
+        let project_path = args["project_path"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("THREADBRIDGE_PROJECT_PATH").ok());
         let query = args["query"]
             .as_str()
             .context("query is required")?;
         let limit = args["limit"].as_u64().unwrap_or(5) as usize;
 
-        let storage = self.storage.lock().unwrap_or_else(|e| e.into_inner());
+        let storage_mode = StorageMode::from_env();
+        let storage = self.storage.lock().unwrap_or_else(|e| {
+            tracing::warn!("Storage mutex was poisoned, recovering");
+            e.into_inner()
+        });
         let config = Config::global();
 
         let query_embedding = EmbeddingService::embed_query(query)
             .context("Failed to generate query embedding")?;
 
-        if let Some(path) = project_path {
-            match storage.load_thread(path)? {
+        if let Some(ref path) = project_path {
+            match storage.load_thread_with_mode(path, &storage_mode)? {
                 Some(mut thread) => {
-                    let vector_store = VectorStore::from_facts(thread.facts.clone());
+                    // Filter out superseded/retracted facts
+                    let active_facts: Vec<Fact> = thread.facts.iter()
+                        .filter(|f| f.revision_status == RevisionStatus::Active)
+                        .cloned()
+                        .collect();
+                    let vector_store = VectorStore::from_facts(active_facts);
 
                     // Use BLL reranking if available
-                    let bll_guard = get_bll().lock().unwrap_or_else(|e| e.into_inner());
+                    let bll_guard = get_bll().lock().unwrap_or_else(|e| {
+                    tracing::warn!("BLL mutex was poisoned, recovering");
+                    e.into_inner()
+                });
                     let results = vector_store.search_hybrid_bll(
                         &query_embedding, query, limit, config.search.min_similarity,
                         bll_guard.as_ref(),
@@ -538,7 +1025,7 @@ Results include surrounding context for richer understanding."#.to_string(),
                             }
                         }
                         thread.updated_at = now;
-                        if let Err(e) = storage.save_thread(&thread, true) {
+                        if let Err(e) = storage.save_thread(&thread, &storage_mode) {
                             debug!("Failed to save access tracking: {}", e);
                         }
                     }
@@ -558,6 +1045,8 @@ Results include surrounding context for richer understanding."#.to_string(),
 
                     info!("Search found {} results for query: {}", results.len(), query);
 
+                    let stale_threshold = config.search.anchor_stale_threshold;
+
                     Ok(json!({
                         "success": true,
                         "query": query,
@@ -565,16 +1054,81 @@ Results include surrounding context for richer understanding."#.to_string(),
                         "results": results.iter().map(|r| {
                             let session_summary = r.fact.session_id.as_deref()
                                 .and_then(|sid| session_map.get(sid).copied());
+
+                            // Enhanced verification markers
+                            let (content, confidence, fact_warnings) = {
+                                let mut markers: Vec<&str> = Vec::new();
+                                let mut conf = r.fact.confidence;
+                                let mut fact_warnings: Vec<String> = Vec::new();
+
+                                // Provenance verification (preferred)
+                                if config.verification.provenance_enabled
+                                    && !r.fact.provenance.dependencies.is_empty()
+                                {
+                                    let mut prov = r.fact.provenance.clone();
+                                    provenance::verify_provenance(path, &mut prov);
+                                    let score = prov.compute_score();
+                                    if score < stale_threshold {
+                                        markers.push("[STALE]");
+                                        conf *= score.max(0.1);
+                                    } else if prov.has_broken_deps() {
+                                        markers.push("[STALE]");
+                                        conf *= score;
+                                    }
+                                }
+
+                                // Contradiction candidate warnings
+                                if config.verification.sheaf_enabled {
+                                    let candidates = thread.cohomology.candidates_involving(&r.fact.id);
+                                    for candidate in &candidates {
+                                        let (other_excerpt, other_date) = if candidate.fact_id_a == r.fact.id {
+                                            (&candidate.excerpt_b, candidate.created_at_b)
+                                        } else {
+                                            (&candidate.excerpt_a, candidate.created_at_a)
+                                        };
+                                        fact_warnings.push(format!(
+                                            "Potential contradiction: this fact vs '{}' ({}). These facts discuss the same topic but differ — verify which is current.",
+                                            other_excerpt,
+                                            other_date.format("%Y-%m")
+                                        ));
+                                    }
+                                    if !candidates.is_empty() {
+                                        markers.push("[INCONSISTENT]");
+                                    }
+                                }
+
+                                // CUSUM alarm
+                                if config.verification.cusum_enabled {
+                                    let alarm = thread.change_tracker.fact_alarm_score(
+                                        &r.fact,
+                                        config.verification.consecutive_threshold,
+                                        config.verification.ewma_threshold,
+                                    );
+                                    if alarm > 0.5 {
+                                        markers.push("[ACTIVELY CHANGING]");
+                                    }
+                                }
+
+                                let content = if markers.is_empty() {
+                                    r.fact.content.clone()
+                                } else {
+                                    format!("{} {}", markers.join(" "), r.fact.content)
+                                };
+                                (content, conf, fact_warnings)
+                            };
+
                             json!({
                                 "fact_id": r.fact.id,
-                                "content": r.fact.content,
+                                "content": content,
                                 "category": r.fact.category,
                                 "score": r.score,
+                                "confidence": confidence,
                                 "context": r.fact.context_window,
                                 "session_summary": session_summary,
                                 "utility_mean": r.fact.utility.mean(),
                                 "access_count": r.fact.access_count,
-                                "created_at": r.fact.created_at
+                                "created_at": r.fact.created_at,
+                                "warnings": fact_warnings
                             })
                         }).collect::<Vec<_>>()
                     }))
@@ -594,9 +1148,16 @@ Results include surrounding context for richer understanding."#.to_string(),
 
             for project in &valid_projects {
                 if let Some(thread) = storage.load_thread(project)? {
-                    let vector_store = VectorStore::from_facts(thread.facts.clone());
+                    let active_facts: Vec<Fact> = thread.facts.iter()
+                        .filter(|f| f.revision_status == RevisionStatus::Active)
+                        .cloned()
+                        .collect();
+                    let vector_store = VectorStore::from_facts(active_facts);
 
-                    let bll_guard = get_bll().lock().unwrap_or_else(|e| e.into_inner());
+                    let bll_guard = get_bll().lock().unwrap_or_else(|e| {
+                    tracing::warn!("BLL mutex was poisoned, recovering");
+                    e.into_inner()
+                });
                     let results = vector_store.search_hybrid_bll(
                         &query_embedding, query, limit, config.search.min_similarity,
                         bll_guard.as_ref(),
@@ -649,10 +1210,14 @@ Results include surrounding context for richer understanding."#.to_string(),
     }
 
     // ================================================================
-    // BLL implicit feedback
+    // Implicit feedback: BLL weight updates + per-fact utility observations
     // ================================================================
 
-    fn process_bll_implicit_feedback(thread: &Thread) {
+    fn process_implicit_feedback(
+        storage: &Arc<Mutex<StorageManager>>,
+        project_path: &str,
+        storage_mode: &StorageMode,
+    ) {
         let records = {
             let mut buf = match search_buffer().lock() {
                 Ok(buf) => buf,
@@ -665,13 +1230,13 @@ Results include surrounding context for richer understanding."#.to_string(),
             return;
         }
 
-        let mut bll_guard = match get_bll().lock() {
-            Ok(guard) => guard,
+        // Load the latest thread from disk (not a stale snapshot)
+        let thread = match storage.lock() {
+            Ok(guard) => match guard.load_thread_with_path_fix(project_path, storage_mode) {
+                Ok(Some(t)) => t,
+                _ => return,
+            },
             Err(_) => return,
-        };
-        let bll = match bll_guard.as_mut() {
-            Some(bll) => bll,
-            None => return,
         };
 
         let fact_map: std::collections::HashMap<&str, &[f32]> = thread.facts.iter()
@@ -683,7 +1248,14 @@ Results include surrounding context for richer understanding."#.to_string(),
             .take(50)
             .collect();
 
-        let mut updates = 0u32;
+        // Compute rewards for all (fact_id, record) pairs
+        struct FeedbackEntry {
+            fact_id: String,
+            query_embedding: Vec<f32>,
+            fact_embedding: Vec<f32>,
+            reward: f32,
+        }
+        let mut entries: Vec<FeedbackEntry> = Vec::new();
 
         for record in &records {
             for fact_id in &record.returned_fact_ids {
@@ -707,29 +1279,74 @@ Results include surrounding context for richer understanding."#.to_string(),
                 } else if max_sim < 0.3 {
                     0.0
                 } else {
-                    continue; // ambiguous
+                    continue; // ambiguous — skip
                 };
 
-                if record.query_embedding.len() != fact_emb.len() {
-                    continue;
-                }
-
-                let features = bll.extract_features(&record.query_embedding, fact_emb);
-                bll.update(&features, reward);
-                updates += 1;
+                entries.push(FeedbackEntry {
+                    fact_id: fact_id.clone(),
+                    query_embedding: record.query_embedding.clone(),
+                    fact_embedding: fact_emb.to_vec(),
+                    reward,
+                });
             }
         }
 
-        if updates > 0 {
-            let posterior_path = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".threadbridge")
-                .join("bll_posterior.bin");
-            if let Err(e) = bll.save_posterior(&posterior_path) {
-                debug!("Failed to save BLL posterior: {}", e);
+        if entries.is_empty() {
+            return;
+        }
+
+        // BLL weight updates (if available)
+        let mut bll_updates = 0u32;
+        if let Ok(mut bll_guard) = get_bll().lock() {
+            if let Some(ref mut bll) = *bll_guard {
+                for entry in &entries {
+                    if entry.query_embedding.len() != entry.fact_embedding.len() {
+                        continue;
+                    }
+                    let features = bll.extract_features(&entry.query_embedding, &entry.fact_embedding);
+                    bll.update(&features, entry.reward);
+                    bll_updates += 1;
+                }
+
+                if bll_updates > 0 {
+                    let posterior_path = dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".threadbridge")
+                        .join("bll_posterior.bin");
+                    if let Err(e) = bll.save_posterior(&posterior_path) {
+                        debug!("Failed to save BLL posterior: {}", e);
+                    }
+                    debug!("BLL implicit feedback: {} updates from {} search records",
+                           bll_updates, records.len());
+                }
             }
-            debug!("BLL implicit feedback: {} updates from {} search records",
-                   updates, records.len());
+        }
+
+        // Per-fact utility updates (Beta-Bernoulli observations)
+        if let Ok(storage_guard) = storage.lock() {
+            if let Ok(Some(mut stored_thread)) = storage_guard.load_thread_with_path_fix(project_path, storage_mode) {
+                let mut obs_map: std::collections::HashMap<&str, Vec<f32>> =
+                    std::collections::HashMap::new();
+                for entry in &entries {
+                    obs_map.entry(entry.fact_id.as_str()).or_default().push(entry.reward);
+                }
+                let mut utility_updated = 0u32;
+                for fact in &mut stored_thread.facts {
+                    if let Some(rewards) = obs_map.get(fact.id.as_str()) {
+                        for &r in rewards {
+                            fact.utility.observe(r);
+                        }
+                        utility_updated += 1;
+                    }
+                }
+                if utility_updated > 0 {
+                    stored_thread.updated_at = Utc::now();
+                    if let Err(e) = storage_guard.save_thread(&stored_thread, storage_mode) {
+                        debug!("Failed to save utility updates: {}", e);
+                    }
+                    debug!("Utility feedback: {} facts updated", utility_updated);
+                }
+            }
         }
     }
 

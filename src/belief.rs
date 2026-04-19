@@ -64,6 +64,15 @@ impl Belief {
             .unwrap_or_else(|_| Beta::new(1.0, 1.0).unwrap());
         dist.sample(&mut thread_rng()) as f32
     }
+
+    /// Observe a reward signal (Beta-Bernoulli bandit update)
+    /// reward ∈ [0, 1]: alpha += reward, beta += (1 - reward)
+    pub fn observe(&mut self, reward: f32) {
+        let reward = reward.clamp(0.0, 1.0);
+        self.alpha += reward;
+        self.beta += 1.0 - reward;
+    }
+
 }
 
 #[cfg(test)]

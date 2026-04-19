@@ -11,10 +11,52 @@
 //! ```
 
 use crate::types::{ProjectMeta, ProjectStatus, Registry, Thread, ThreadInfo};
+use crate::util::atomic_write;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
+
+/// Where to store thread data.
+///
+/// Resolved from `THREADBRIDGE_STORAGE` env var:
+/// - `"true"` (default): local storage at `<project_path>/.threadbridge/`
+/// - `"false"`: global storage at `~/.threadbridge/projects/<hash>/`
+/// - absolute path: custom storage at `<path>/.threadbridge/`
+#[derive(Debug, Clone)]
+pub enum StorageMode {
+    Local,
+    Global,
+    Custom(PathBuf),
+}
+
+impl StorageMode {
+    /// Resolve storage mode from the `THREADBRIDGE_STORAGE` environment variable.
+    /// Defaults to `Local` if not set.
+    pub fn from_env() -> Self {
+        match std::env::var("THREADBRIDGE_STORAGE") {
+            Ok(val) => Self::parse(&val),
+            Err(_) => Self::Local,
+        }
+    }
+
+    /// Parse a string value into a StorageMode.
+    pub fn parse(val: &str) -> Self {
+        match val.to_lowercase().as_str() {
+            "true" => Self::Local,
+            "false" => Self::Global,
+            path => {
+                let p = Path::new(path);
+                if p.is_absolute() {
+                    Self::Custom(p.to_path_buf())
+                } else {
+                    tracing::warn!("THREADBRIDGE_STORAGE value '{}' is not an absolute path, defaulting to local", val);
+                    Self::Local
+                }
+            }
+        }
+    }
+}
 
 pub struct StorageManager {
     base_dir: PathBuf,
@@ -77,7 +119,7 @@ impl StorageManager {
         let path = self.registry_path();
         let content = serde_json::to_string_pretty(registry)
             .context("Failed to serialize registry")?;
-        fs::write(&path, content)
+        atomic_write(&path, content.as_bytes())
             .context("Failed to write registry file")?;
         debug!("Saved registry with {} projects", registry.projects.len());
         Ok(())
@@ -102,18 +144,95 @@ impl StorageManager {
         let path = Self::local_meta_path(project_path);
         let content = serde_json::to_string_pretty(meta)
             .context("Failed to serialize meta")?;
-        fs::write(&path, content)
+        atomic_write(&path, content.as_bytes())
             .context("Failed to write meta file")?;
         debug!("Saved meta for project: {}", project_path);
         Ok(())
+    }
+
+    /// Return existing meta or create + persist a new one.
+    /// Only writes to disk when meta.json does not yet exist.
+    fn ensure_meta(project_path: &str) -> Result<ProjectMeta> {
+        if let Some(meta) = Self::load_meta(project_path)? {
+            return Ok(meta);
+        }
+        let name = Path::new(project_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let meta = ProjectMeta::new(name);
+        Self::save_meta(project_path, &meta)?;
+        Ok(meta)
+    }
+
+    /// Ensure meta.json exists, then update the global registry.
+    /// Called after thread.json is already persisted.
+    /// Collects secondary write failures into a single error message.
+    fn ensure_meta_and_registry(&self, project_path: &str) -> Result<()> {
+        let mut errors: Vec<String> = Vec::new();
+
+        let meta = match Self::ensure_meta(project_path) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                errors.push(format!("meta.json: {}", e));
+                None
+            }
+        };
+
+        if let Some(meta) = meta {
+            let registry_result = self.load_registry()
+                .and_then(|mut registry| {
+                    registry.register(&meta.project_id, &meta.project_name, project_path);
+                    self.save_registry(&registry)
+                });
+            if let Err(e) = registry_result {
+                errors.push(format!("registry.json: {}", e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "thread.json saved, but secondary writes failed: {}",
+                errors.join("; ")
+            )
+        }
     }
 
     fn path_is_valid(path: &str) -> bool {
         Path::new(path).is_dir()
     }
 
+    /// Resolve the .threadbridge directory for a custom storage path.
+    fn custom_threadbridge_dir(custom_path: &Path) -> PathBuf {
+        custom_path.join(".threadbridge")
+    }
+
+    fn custom_thread_path(custom_path: &Path) -> PathBuf {
+        Self::custom_threadbridge_dir(custom_path).join("thread.json")
+    }
+
     pub fn load_thread(&self, project_path: &str) -> Result<Option<Thread>> {
-        // Try local first
+        self.load_thread_with_mode(project_path, &StorageMode::from_env())
+    }
+
+    pub fn load_thread_with_mode(&self, project_path: &str, mode: &StorageMode) -> Result<Option<Thread>> {
+        // For Custom mode, check custom path first
+        if let StorageMode::Custom(ref custom_path) = mode {
+            let custom_thread = Self::custom_thread_path(custom_path);
+            if custom_thread.exists() {
+                let content = fs::read_to_string(&custom_thread)
+                    .context("Failed to read custom thread file")?;
+                let thread: Thread = serde_json::from_str(&content)
+                    .context("Failed to parse custom thread file")?;
+                debug!("Loaded thread from custom storage: {:?} ({} facts)", custom_path, thread.facts.len());
+                return Ok(Some(thread));
+            }
+        }
+
+        // Try local
         let local_path = Self::local_thread_path(project_path);
         if local_path.exists() {
             let content = fs::read_to_string(&local_path)
@@ -139,63 +258,70 @@ impl StorageManager {
         Ok(None)
     }
 
-    pub fn save_thread(&self, thread: &Thread, use_local: bool) -> Result<()> {
+    pub fn save_thread(&self, thread: &Thread, mode: &StorageMode) -> Result<()> {
         let project_path = &thread.project_path;
-        let local_dir = Self::local_threadbridge_dir(project_path);
-        let should_use_local = use_local || local_dir.exists();
 
-        if should_use_local {
-            fs::create_dir_all(&local_dir)
-                .context("Failed to create local .threadbridge directory")?;
+        match mode {
+            StorageMode::Local => {
+                let local_dir = Self::local_threadbridge_dir(project_path);
+                self.save_thread_to_dir(&local_dir, thread)?;
+                info!("Saved thread locally: {} ({} facts, {} sessions)",
+                    project_path, thread.facts.len(), thread.sessions.len());
+            }
+            StorageMode::Global => {
+                let project_dir = self.global_project_dir(project_path);
+                fs::create_dir_all(&project_dir)
+                    .context("Failed to create global project directory")?;
 
-            let path = Self::local_thread_path(project_path);
-            let content = serde_json::to_string_pretty(thread)
-                .context("Failed to serialize thread")?;
-            fs::write(&path, content)
-                .context("Failed to write local thread file")?;
+                let path = self.global_thread_path(project_path);
+                let content = serde_json::to_string_pretty(thread)
+                    .context("Failed to serialize thread")?;
+                atomic_write(&path, content.as_bytes())
+                    .context("Failed to write global thread file")?;
 
-            // Ensure meta.json exists
-            let meta = Self::load_meta(project_path)?
-                .unwrap_or_else(|| {
-                    let name = Path::new(project_path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    ProjectMeta::new(name)
-                });
-            Self::save_meta(project_path, &meta)?;
+                self.ensure_meta_and_registry(project_path)?;
 
-            // Update registry
-            let mut registry = self.load_registry()?;
-            registry.register(&meta.project_id, &meta.project_name, project_path);
-            self.save_registry(&registry)?;
-
-            info!("Saved thread locally: {} ({} facts, {} sessions)",
-                project_path, thread.facts.len(), thread.sessions.len());
-        } else {
-            let project_dir = self.global_project_dir(project_path);
-            fs::create_dir_all(&project_dir)
-                .context("Failed to create global project directory")?;
-
-            let path = self.global_thread_path(project_path);
-            let content = serde_json::to_string_pretty(thread)
-                .context("Failed to serialize thread")?;
-            fs::write(&path, content)
-                .context("Failed to write global thread file")?;
-
-            info!("Saved thread globally: {} ({} facts)", project_path, thread.facts.len());
+                info!("Saved thread globally: {} ({} facts)", project_path, thread.facts.len());
+            }
+            StorageMode::Custom(ref custom_path) => {
+                let custom_dir = Self::custom_threadbridge_dir(custom_path);
+                self.save_thread_to_dir(&custom_dir, thread)?;
+                info!("Saved thread to custom path: {:?} ({} facts, {} sessions)",
+                    custom_path, thread.facts.len(), thread.sessions.len());
+            }
         }
 
         Ok(())
     }
 
-    pub fn load_thread_with_path_fix(&self, project_path: &str) -> Result<Option<Thread>> {
+    /// Save thread to a .threadbridge directory (shared by Local and Custom modes).
+    fn save_thread_to_dir(&self, dir: &Path, thread: &Thread) -> Result<()> {
+        let project_path = &thread.project_path;
+        fs::create_dir_all(dir)
+            .context("Failed to create .threadbridge directory")?;
+
+        // Critical write: thread.json is the source of truth
+        let path = dir.join("thread.json");
+        let content = serde_json::to_string_pretty(thread)
+            .context("Failed to serialize thread")?;
+        atomic_write(&path, content.as_bytes())
+            .context("Failed to write thread file")?;
+
+        // Secondary writes: meta.json (ensure exists) + registry.json (update index)
+        self.ensure_meta_and_registry(project_path)?;
+
+        Ok(())
+    }
+
+    pub fn load_thread_with_path_fix(&self, project_path: &str, mode: &StorageMode) -> Result<Option<Thread>> {
+        let mut old_path: Option<String> = None;
+
         if let Some(meta) = Self::load_meta(project_path)? {
             let mut registry = self.load_registry()?;
             if let Some(entry) = registry.projects.get(&meta.project_id) {
                 if entry.last_known_path != project_path {
                     info!("Project moved: {} -> {}", entry.last_known_path, project_path);
+                    old_path = Some(entry.last_known_path.clone());
                     registry.update_path(&meta.project_id, project_path);
                     self.save_registry(&registry)?;
                 }
@@ -204,7 +330,22 @@ impl StorageManager {
                 self.save_registry(&registry)?;
             }
         }
-        self.load_thread(project_path)
+
+        // Global mode: data lives at md5(old_path), so load from there
+        let load_path = match (&old_path, mode) {
+            (Some(old), StorageMode::Global) => old.as_str(),
+            _ => project_path,
+        };
+
+        let thread = self.load_thread_with_mode(load_path, mode)?;
+        Ok(thread.map(|mut t| {
+            if t.project_path != project_path {
+                info!("Fixing thread project_path: {} -> {}", t.project_path, project_path);
+                t.project_path = project_path.to_string();
+                t.project_hash = format!("{:x}", md5::compute(project_path));
+            }
+            t
+        }))
     }
 
     pub fn list_projects_with_status(&self) -> Result<Vec<ThreadInfo>> {
@@ -244,8 +385,21 @@ impl StorageManager {
         // Check global storage for projects not in registry
         let projects_dir = self.base_dir.join("projects");
         if projects_dir.exists() {
-            for entry in fs::read_dir(&projects_dir)? {
-                let entry = entry?;
+            let read_dir = match fs::read_dir(&projects_dir) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    tracing::warn!("Failed to read projects directory {:?}: {}", projects_dir, e);
+                    return Ok(threads_info);
+                }
+            };
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!("Failed to read directory entry in {:?}: {}", projects_dir, e);
+                        continue;
+                    }
+                };
                 let thread_path = entry.path().join("thread.json");
                 if thread_path.exists() {
                     if let Ok(content) = fs::read_to_string(&thread_path) {
@@ -298,11 +452,6 @@ impl StorageManager {
 
 }
 
-impl Default for StorageManager {
-    fn default() -> Self {
-        Self::new().expect("Failed to create default storage manager")
-    }
-}
 
 impl Clone for StorageManager {
     fn clone(&self) -> Self {
@@ -320,14 +469,18 @@ mod tests {
     #[test]
     fn test_save_and_load_thread_global() {
         let temp_dir = tempdir().unwrap();
-        let storage = StorageManager::with_base_dir(temp_dir.path().to_path_buf()).unwrap();
+        let project_dir = temp_dir.path().join("my_project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_str().unwrap();
 
-        let thread = Thread::new("/test/project".to_string());
-        storage.save_thread(&thread, false).unwrap();
+        let storage = StorageManager::with_base_dir(temp_dir.path().join(".threadbridge")).unwrap();
 
-        let loaded = storage.load_thread("/test/project").unwrap();
+        let thread = Thread::new(project_path.to_string());
+        storage.save_thread(&thread, &StorageMode::Global).unwrap();
+
+        let loaded = storage.load_thread_with_mode(project_path, &StorageMode::Global).unwrap();
         assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().project_path, "/test/project");
+        assert_eq!(loaded.unwrap().project_path, project_path);
     }
 
     #[test]
@@ -339,7 +492,7 @@ mod tests {
         let storage = StorageManager::with_base_dir(temp_dir.path().join(".threadbridge")).unwrap();
         let project_path = project_dir.to_str().unwrap();
         let thread = Thread::new(project_path.to_string());
-        storage.save_thread(&thread, true).unwrap();
+        storage.save_thread(&thread, &StorageMode::Local).unwrap();
 
         let local_thread_path = project_dir.join(".threadbridge").join("thread.json");
         assert!(local_thread_path.exists());

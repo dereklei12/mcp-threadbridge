@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::panic;
+
 use tracing::{debug, error, info};
 
 /// JSON-RPC Request
@@ -290,7 +291,7 @@ impl McpServer {
             let response = self.handle_request_safe(&request);
 
             // Don't send response for notifications (no id)
-            if request.id.is_some() || response.error.is_some() {
+            if request.id.is_some() {
                 let response_str = serde_json::to_string(&response)?;
                 debug!("Sending: {} bytes", response_str.len());
                 writeln!(stdout, "{}", response_str)?;

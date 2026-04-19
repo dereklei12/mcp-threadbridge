@@ -1,12 +1,20 @@
+mod anchor;
 mod belief;
 mod bll;
 mod config;
+mod cusum;
 mod embedding;
+mod file_manifest;
 mod mcp;
+mod provenance;
+mod revision;
+mod sheaf;
 mod storage;
 mod tools;
 mod types;
+mod util;
 mod vector_store;
+mod verification_budget;
 
 use anyhow::Result;
 use config::Config;

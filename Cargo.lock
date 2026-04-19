@@ -1487,6 +1487,7 @@ dependencies = [
  "ndarray 0.15.6",
  "rand 0.8.5",
  "rand_distr",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
