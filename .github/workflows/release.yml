@@ -60,11 +60,16 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Stage BLL weights
+        run: cp weights/bll_v2.bin artifacts/bll_v2.bin
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

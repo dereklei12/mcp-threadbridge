@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info, warn};
@@ -37,8 +37,15 @@ fn get_bll() -> &'static Mutex<Option<BayesianLastLayer>> {
             return Mutex::new(None);
         }
 
-        let weights_path = Path::new(&config.search.bll_weights_path);
-        match BayesianLastLayer::try_load(weights_path) {
+        let weights_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("bll_v2.bin")));
+
+        let bll = weights_path
+            .as_ref()
+            .and_then(|p| BayesianLastLayer::try_load(p));
+
+        match bll {
             Some(mut bll) => {
                 let posterior_path = dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -47,7 +54,11 @@ fn get_bll() -> &'static Mutex<Option<BayesianLastLayer>> {
                 if let Err(e) = bll.load_posterior(&posterior_path) {
                     debug!("No saved BLL posterior: {}", e);
                 }
-                info!("BLL reranker loaded ({} prior updates)", bll.update_count());
+                info!(
+                    "BLL reranker loaded from {} ({} prior updates)",
+                    weights_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    bll.update_count()
+                );
                 Mutex::new(Some(bll))
             }
             None => {
